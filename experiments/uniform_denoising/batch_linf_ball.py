@@ -1,0 +1,116 @@
+import os
+os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+import numpy as np
+import torch
+from skimage.metrics import peak_signal_noise_ratio
+from matplotlib.pyplot import imread, imsave
+from skimage.transform import resize
+import time
+import sys
+
+sys.path.append('../')
+
+from admm_utils import *
+from torch import optim
+from models import *
+import math
+import glob
+
+torch.backends.cudnn.enabled = True
+torch.backends.cudnn.benchmark = True
+
+def run(f_name, specific_result_dir, noise_sigma, num_iter, rho, sigma_0):
+    if torch.cuda.is_available():
+        dtype = torch.cuda.FloatTensor
+    else:
+        dtype = torch.FloatTensor
+
+    img = imread(f_name)
+    if img.dtype == 'uint8':
+        img = img.astype('float32') / 255  # scale to [0, 1]
+    elif img.dtype == 'float32':
+        img = img.astype('float32')
+    else:
+        raise TypeError()
+    img = np.clip(resize(img, (128, 128)), 0, 1)
+    imsave(specific_result_dir + 'true.png', img)
+    img = img.transpose((2, 0, 1))
+    x_true = torch.from_numpy(img).unsqueeze(0).type(dtype)
+
+    b = x_true
+    b = b + noise_sigma * (2 * torch.rand(b.shape) - 1).type(dtype)
+    b_clip = torch.clamp(b, 0, 1)
+    imsave(specific_result_dir + 'corrupted.png',
+           b_clip.reshape(1, 3, 128, 128)[0].permute((1, 2, 0)).cpu().numpy())
+
+    def fn(x):
+        return torch.norm(x - b) ** 2 / 2
+
+    v = torch.zeros_like(x_true).type(dtype).uniform_()
+    x = v.clone().detach()
+    scaled_lambda_ = torch.zeros_like(x, requires_grad=False).normal_().type(dtype)
+
+    sigma_0 = torch.tensor(sigma_0).type(dtype)
+
+    inv = 1 + rho
+    inv = 1 / inv
+
+    record = {"psnr_gt": [],
+              "mse_gt": [],
+              "total_loss": [],
+              "prior_loss": [],
+              "fidelity_loss": [],
+              "cpu_time": [],
+              }
+
+    for t in range(num_iter):
+        # for x (exact min)
+        x = inv * (b - rho * (scaled_lambda_ - v))
+
+        # for v (exact min with prox op)
+        v = linf_proj(x + scaled_lambda_, b, noise_sigma)
+
+        # for dual var(lambda)
+        scaled_lambda_.add_(sigma_0 * rho * (x - v))
+
+        results = x.detach()
+        results = torch.clamp(results, 0, 1)
+        if (t + 1) % 10000 == 0:
+            imsave(specific_result_dir + 'iter%d_PSNR_%.2f.png' % (t, psnr_gt), results[0].cpu().numpy().transpose((1, 2, 0)))
+
+        psnr_gt = peak_signal_noise_ratio(x_true.cpu().numpy(), results.detach().cpu().numpy())
+        mse_gt = np.mean((x_true.cpu().numpy() - results.detach().cpu().numpy()) ** 2)
+        fidelity_loss = fn(results).detach()
+
+        record["psnr_gt"].append(psnr_gt)
+        record["mse_gt"].append(mse_gt)
+        record["fidelity_loss"].append(fidelity_loss.item())
+        record["cpu_time"].append(time.time())
+
+        if (t + 1) % 10 == 0:
+            print('Img %d Iteration %5d PSRN_gt: %.2f MSE_gt: %e' % (f_num, t + 1, psnr_gt, mse_gt))
+    np.savez(specific_result_dir + 'record', **record)
+
+# torch.manual_seed(500)
+if torch.cuda.is_available():
+    dtype = torch.cuda.FloatTensor
+else:
+    dtype = torch.FloatTensor
+
+dataset_dir = '../../data/'
+results_dir = '../../data/linf_ball/'
+
+os.makedirs(results_dir)
+f_name_list = glob.glob('../../data/*.jpg')
+
+for f_num, f_name in enumerate(f_name_list):
+
+    specific_result_dir = results_dir+str(f_num)+'/'
+    os.makedirs(specific_result_dir)
+    run(f_name=f_name,
+        specific_result_dir=specific_result_dir,
+        noise_sigma=50/255,
+        num_iter=50000,
+        rho=1,
+        sigma_0=1)
